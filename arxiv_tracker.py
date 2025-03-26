@@ -9,92 +9,61 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
+from email.utils import formataddr
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Iterator
+from typing import List, Dict, Optional, Iterator, Tuple
 from dotenv import load_dotenv
 
-# 加载环境变量
+# Load environment variables
 load_dotenv()
 
 class Config:
-    # API配置
+    # API Configuration
     API_KEY = os.getenv("OPENAI_API_KEY")
     API_BASE = os.getenv("OPENAI_API_BASE")
     LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4-1106-preview")
     
-    # 搜索配置
+    # Search Configuration
     SEARCH_TOPICS = [t.strip() for t in os.getenv("SEARCH_TOPICS", "large language models,reinforcement learning,computer vision").split(",")]
     MAX_PAPERS_PER_TOPIC = int(os.getenv("MAX_PAPERS_PER_TOPIC", 30))
     DAYS_BACK = int(os.getenv("DAYS_BACK", 3))
+    SUMMARY_LANGUAGE = os.getenv("SUMMARY_LANGUAGE", "zh").lower()  # 'zh' or 'en'
     
-    # 文件路径
+    # File Paths
     PDF_DIR = os.getenv("PDF_DIR", "papers_pdf")
     DATABASE_FILE = os.getenv("DATABASE_FILE", "arxiv_papers.db")
     OUTPUT_DIR = os.getenv("OUTPUT_DIR", "summaries")
     
-    # 延迟设置
+    # Delay Settings (seconds)
     MIN_API_DELAY = float(os.getenv("MIN_API_DELAY", 0.5))
     MAX_API_DELAY = float(os.getenv("MAX_API_DELAY", 1.0))
     MIN_DOWNLOAD_DELAY = float(os.getenv("MIN_DOWNLOAD_DELAY", 1))
     MAX_DOWNLOAD_DELAY = float(os.getenv("MAX_DOWNLOAD_DELAY", 3))
     
-    # 邮件配置
+    # Email Configuration
     EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "true").lower() == "true"
+    EMAIL_DISPLAY_NAME = os.getenv("EMAIL_DISPLAY_NAME", "ArXiv论文助手")
     EMAIL_SENDER = os.getenv("EMAIL_SENDER")
     EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
     EMAIL_RECEIVERS = [email.strip() for email in os.getenv("EMAIL_RECEIVERS", "").split(",") if email.strip()]
-    SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+    SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.163.com")
+    SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
 
-# 初始化客户端
+# Initialize clients
 arxiv_client = arxiv.Client()
 openai_client = openai.OpenAI(
     api_key=Config.API_KEY,
     base_url=Config.API_BASE
 )
 
-def send_email(subject: str, content: str, attachment_path: str = None):
-    """发送邮件（适配163邮箱）"""
-    if not Config.EMAIL_ENABLED or not Config.EMAIL_RECEIVERS:
-        print("邮件功能未启用或未配置收件人")
-        return False
-    
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = Config.EMAIL_SENDER
-        msg['To'] = ", ".join(Config.EMAIL_RECEIVERS)
-        msg['Subject'] = subject
-        
-        # 邮件正文（UTF-8编码）
-        msg.attach(MIMEText(content, 'plain', 'utf-8'))
-        
-        # 添加附件
-        if attachment_path and os.path.exists(attachment_path):
-            with open(attachment_path, "rb") as f:
-                part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
-            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment_path)}"'
-            msg.attach(part)
-        
-        # 163邮箱专用连接方式
-        with smtplib.SMTP_SSL(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
-            server.login(Config.EMAIL_SENDER, Config.EMAIL_PASSWORD)
-            server.sendmail(Config.EMAIL_SENDER, Config.EMAIL_RECEIVERS, msg.as_string())
-        
-        print(f"邮件成功发送到 {len(Config.EMAIL_RECEIVERS)} 个收件人")
-        return True
-    except Exception as e:
-        print(f"邮件发送失败: {str(e)}")
-        return False
-
 def get_output_filename(topic: str) -> str:
-    """生成带日期时间和主题的输出文件名"""
+    """Generate output filename with date and topic"""
     now = datetime.now()
     safe_topic = "".join(c if c.isalnum() else "_" for c in topic)
-    filename = f"arxiv_{safe_topic}_{now.strftime('%Y%m%d_%H%M%S')}.txt"
-    return os.path.join(Config.OUTPUT_DIR, filename)
+    return os.path.join(Config.OUTPUT_DIR, f"arxiv_{safe_topic}_{now.strftime('%Y%m%d')}.txt")
 
 def init_database():
-    """初始化SQLite数据库"""
+    """Initialize SQLite database"""
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
     os.makedirs(Config.PDF_DIR, exist_ok=True)
     conn = sqlite3.connect(Config.DATABASE_FILE)
@@ -106,7 +75,7 @@ def init_database():
     conn.close()
 
 def is_paper_processed(paper_id: str) -> bool:
-    """检查论文是否已处理过"""
+    """Check if paper has been processed"""
     conn = sqlite3.connect(Config.DATABASE_FILE)
     c = conn.cursor()
     c.execute("SELECT 1 FROM processed_papers WHERE paper_id=?", (paper_id,))
@@ -115,7 +84,7 @@ def is_paper_processed(paper_id: str) -> bool:
     return result is not None
 
 def mark_paper_as_processed(paper_id: str):
-    """将论文标记为已处理"""
+    """Mark paper as processed in database"""
     conn = sqlite3.connect(Config.DATABASE_FILE)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO processed_papers VALUES (?, ?)",
@@ -124,7 +93,7 @@ def mark_paper_as_processed(paper_id: str):
     conn.close()
 
 def search_arxiv_papers(topic: str) -> Iterator[arxiv.Result]:
-    """搜索ArXiv论文"""
+    """Search for papers on arXiv"""
     search = arxiv.Search(
         query=topic,
         max_results=Config.MAX_PAPERS_PER_TOPIC,
@@ -133,15 +102,15 @@ def search_arxiv_papers(topic: str) -> Iterator[arxiv.Result]:
     )
     return arxiv_client.results(search)
 
-def download_pdf(paper: arxiv.Result) -> Optional[tuple]:
-    """下载论文PDF并返回文本内容"""
+def download_pdf(paper: arxiv.Result) -> Optional[Tuple[str, str]]:
+    """Download paper PDF and return (text content, file path)"""
     paper_id = paper.get_short_id()
     filename = f"{paper_id}.pdf"
     filepath = os.path.join(Config.PDF_DIR, filename)
     
     try:
         delay = random.uniform(Config.MIN_DOWNLOAD_DELAY, Config.MAX_DOWNLOAD_DELAY)
-        print(f"等待 {delay:.1f} 秒后下载PDF...")
+        print(f"Waiting {delay:.1f}s before downloading PDF...")
         time.sleep(delay)
         
         paper.download_pdf(filename=filepath)
@@ -152,64 +121,175 @@ def download_pdf(paper: arxiv.Result) -> Optional[tuple]:
         
         return text, filepath
     except Exception as e:
-        print(f"下载或处理PDF失败: {str(e)}")
+        print(f"Failed to download/process PDF: {str(e)}")
         return None
 
-def generate_llm_summary(paper: arxiv.Result, paper_text: str, topic: str) -> str:
-    """使用LLM生成中文结构化论文摘要"""
-    prompt = f"""请为以下学术论文生成详细的中文摘要，必须包含以下六个部分：
+def get_summary_prompt(paper: arxiv.Result, paper_text: str) -> str:
+    """Generate appropriate prompt based on configured language"""
+    if Config.SUMMARY_LANGUAGE == "zh":
+        return f"""请为以下学术论文生成详细的中文摘要，必须包含以下六个部分：
 
-1. 研究背景与动机
-2. 核心问题
-3. 方法与技术
-4. 关键结果
-5. 创新与贡献
-6. 意义与展望
+(1). 研究背景与动机
+(2). 核心问题
+(3). 方法与技术
+(4). 关键结果
+(5). 创新与贡献
+(6). 意义与展望
 
 论文信息:
 标题: {paper.title}
 作者: {', '.join(author.name for author in paper.authors)}
 发表日期: {paper.published.date() if paper.published else '未知'}
-ArXiv链接: {paper.entry_id}
+链接: {paper.entry_id}
 
 请基于以下论文内容生成摘要:
 {paper_text[:12000]}..."""
+    else:  # Default to English
+        return f"""Please generate a detailed academic summary in English with the following six sections:
 
+(1). Background and Motivation
+(2). Core Problem
+(3). Methodology
+(4). Key Results
+(5). Innovations and Contributions
+(6). Implications and Future Work
+
+Paper Info:
+Title: {paper.title}
+Authors: {', '.join(author.name for author in paper.authors)}
+Date: {paper.published.date() if paper.published else 'Unknown'}
+Link: {paper.entry_id}
+
+Please generate the summary based on:
+{paper_text[:12000]}..."""
+
+def get_system_message() -> str:
+    """Get system message based on configured language"""
+    if Config.SUMMARY_LANGUAGE == "zh":
+        return "你是一位资深学术研究员，需要用专业但易懂的中文总结论文核心内容。"
+    else:
+        return "You are a senior academic researcher who needs to summarize paper core content professionally but accessibly."
+
+def generate_llm_summary(paper: arxiv.Result, paper_text: str) -> str:
+    """Generate structured paper summary using LLM"""
+    prompt = get_summary_prompt(paper, paper_text)
+    system_message = get_system_message()
+    
     try:
         delay = random.uniform(Config.MIN_API_DELAY, Config.MAX_API_DELAY)
-        print(f"等待 {delay:.1f} 秒后调用API生成中文摘要...")
+        print(f"Waiting {delay:.1f}s before calling API for {Config.SUMMARY_LANGUAGE} summary...")
         time.sleep(delay)
         
         response = openai_client.chat.completions.create(
             model=Config.LLM_MODEL,
             messages=[
-                {"role": "system", "content": "你是一位资深学术研究员，需要用中文总结论文核心内容。"},
+                {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"生成摘要时出错: {str(e)}")
-        return f"无法生成中文摘要: {str(e)}"
+        print(f"Failed to generate summary: {str(e)}")
+        return f"Summary generation failed: {str(e)}"
 
-def process_topic(topic: str) -> List[Dict]:
-    """处理单个主题，返回论文摘要列表"""
-    print(f"\n{'='*40}")
-    print(f"开始处理主题: {topic}")
+def create_summary_file(topic: str, summaries: List[Dict]) -> str:
+    """Create summary file and return file path"""
+    output_file = get_output_filename(topic)
+    with open(output_file, "w", encoding="utf-8") as f:
+        # File header
+        f.write("=" * 80 + "\n")
+        f.write(f"ArXiv Paper Summary - {topic}\n")
+        f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 80 + "\n\n")
+        
+        # Paper details
+        for i, summary in enumerate(summaries, 1):
+            f.write(f"[Paper {i}]\n")
+            f.write(f"Title: {summary['title']}\n")
+            f.write(f"Link: {summary['url']}\n")
+            f.write(f"Date: {summary['published']}\n")
+            f.write(f"Authors: {summary['authors']}\n\n")
+            
+            f.write("=== Original Abstract ===\n")
+            f.write(f"{summary['arxiv_summary']}\n\n")
+            
+            f.write(f"=== Generated Summary ({Config.SUMMARY_LANGUAGE.upper()}) ===\n")
+            f.write(f"{summary['llm_summary']}\n")
+            f.write("=" * 80 + "\n\n")
+    
+    return output_file
+
+def send_summary_email(summaries: List[Dict], attachments: List[str]) -> bool:
+    """Send summary email with all attachments in one message"""
+    if not Config.EMAIL_ENABLED or not Config.EMAIL_RECEIVERS:
+        print("Email disabled or no receivers configured")
+        return False
+    
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = formataddr((Config.EMAIL_DISPLAY_NAME, Config.EMAIL_SENDER))
+        msg['To'] = ", ".join(Config.EMAIL_RECEIVERS)
+        msg['Subject'] = f"ArXiv Paper Summary {datetime.now().strftime('%Y-%m-%d')}"
+        
+        # Email body content
+        if Config.SUMMARY_LANGUAGE == "zh":
+            email_content = f"ArXiv论文摘要 ({datetime.now().strftime('%Y-%m-%d')})\n\n"
+            email_content += f"发现 {len(summaries)} 篇新论文\n\n"
+        else:
+            email_content = f"ArXiv Paper Summary ({datetime.now().strftime('%Y-%m-%d')})\n\n"
+            email_content += f"Found {len(summaries)} new papers\n\n"
+        
+        for i, summary in enumerate(summaries, 1):
+            email_content += f"{i}. {summary['title']}\n"
+            email_content += f"Link: {summary['url']}\n"
+            email_content += f"Summary ({Config.SUMMARY_LANGUAGE.upper()}):\n"
+            email_content += f"{summary['llm_summary']}\n"
+            email_content += "-" * 60 + "\n"
+        
+        msg.attach(MIMEText(email_content, 'plain', 'utf-8'))
+        
+        # Add all attachments
+        for attachment in attachments:
+            if os.path.exists(attachment):
+                with open(attachment, "rb") as f:
+                    part = MIMEApplication(f.read(), Name=os.path.basename(attachment))
+                part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment)}"'
+                msg.attach(part)
+        
+        # Send with SSL
+        with smtplib.SMTP_SSL(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
+            server.login(Config.EMAIL_SENDER, Config.EMAIL_PASSWORD)
+            server.sendmail(Config.EMAIL_SENDER, Config.EMAIL_RECEIVERS, msg.as_string())
+        
+        print(f"Email sent successfully to {len(Config.EMAIL_RECEIVERS)} recipients")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        print("Authentication failed! Please check:")
+        print("1. Using authorization code (not password)")
+        print("2. SMTP service is enabled")
+        print("3. Authorization code is valid")
+    except Exception as e:
+        print(f"Email sending failed: {str(e)}")
+    return False
+
+def process_topic(topic: str) -> Tuple[List[Dict], str]:
+    """Process a single topic, return (summaries, output_file_path)"""
+    print(f"\n{'=' * 40}")
+    print(f"Processing topic: {topic}")
     
     papers = list(search_arxiv_papers(topic))
     new_papers = [p for p in papers if not is_paper_processed(p.get_short_id())]
     
     if not new_papers:
-        print(f"没有发现新论文。")
-        return []
+        print("No new papers found.")
+        return [], ""
     
-    print(f"\n找到 {len(new_papers)} 篇新论文，开始处理...")
+    print(f"\nFound {len(new_papers)} new papers, processing...")
     summaries = []
     
     for i, paper in enumerate(new_papers, 1):
-        print(f"\n[进度 {i}/{len(new_papers)}] {paper.title}")
+        print(f"\n[Progress {i}/{len(new_papers)}] {paper.title}")
         
         try:
             result = download_pdf(paper)
@@ -217,83 +297,57 @@ def process_topic(topic: str) -> List[Dict]:
                 continue
                 
             paper_text, pdf_path = result
-            llm_summary = generate_llm_summary(paper, paper_text, topic)
+            llm_summary = generate_llm_summary(paper, paper_text)
             
-            summary = {
+            summaries.append({
                 "title": paper.title,
                 "url": paper.entry_id,
+                "published": str(paper.published.date()) if paper.published else "Unknown",
+                "authors": ", ".join(author.name for author in paper.authors),
                 "arxiv_summary": paper.summary,
                 "llm_summary": llm_summary,
                 "pdf_path": pdf_path
-            }
+            })
             
-            summaries.append(summary)
             mark_paper_as_processed(paper.get_short_id())
-            print("论文处理完成!")
-            
+            print("Paper processed successfully!")
         except Exception as e:
-            print(f"处理论文时出错: {str(e)}")
+            print(f"Error processing paper: {str(e)}")
             continue
     
-    return summaries
+    # Save summary file
+    if summaries:
+        output_file = create_summary_file(topic, summaries)
+        return summaries, output_file
+    
+    return [], ""
 
 def main():
-    print("初始化数据库...")
+    """Main execution function"""
+    print("Initializing database...")
     init_database()
     
     start_time = time.time()
     all_summaries = []
-    email_attachments = []
+    all_attachments = []
     
-    # 处理所有主题
+    # Process all topics
     for topic in Config.SEARCH_TOPICS:
-        topic_summaries = process_topic(topic)
+        topic_summaries, output_file = process_topic(topic)
         all_summaries.extend(topic_summaries)
-        
-        # 保存当前主题结果
-        if topic_summaries:
-            output_file = get_output_filename(topic)
-            email_attachments.append(output_file)
-            
-            with open(output_file, "w", encoding="utf-8") as f:
-                f.write(f"ArXiv论文AI摘要汇总\n")
-                f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"主题: {topic}\n")
-                f.write(f"共处理 {len(topic_summaries)} 篇新论文\n\n")
-                
-                for summary in topic_summaries:
-                    f.write(f"【论文标题】 {summary['title']}\n")
-                    f.write(f"【ArXiv链接】 {summary['url']}\n\n")
-                    f.write("=== AI生成中文摘要 ===\n")
-                    f.write(f"{summary['llm_summary']}\n")
-                    f.write("="*80 + "\n\n")
+        if output_file:
+            all_attachments.append(output_file)
     
-    # 发送汇总邮件
-    if all_summaries and Config.EMAIL_ENABLED and Config.EMAIL_RECEIVERS:
-        email_content = f"今日ArXiv论文摘要汇总 ({datetime.now().strftime('%Y-%m-%d')})\n\n"
-        email_content += f"共找到 {len(all_summaries)} 篇新论文\n\n"
-        email_content += "详细信息请查看附件中的摘要文件。\n\n"
-        email_content += "以下是各论文基本信息：\n\n"
-        
-        for summary in all_summaries:
-            email_content += f"论文标题: {summary['title']}\n"
-            email_content += f"ArXiv链接: {summary['url']}\n"
-            email_content += "-"*60 + "\n"
-        
-        # 发送邮件（带所有附件）
-        for attachment in email_attachments:
-            send_email(
-                subject=f"ArXiv论文摘要 {datetime.now().strftime('%Y-%m-%d')}",
-                content=email_content,
-                attachment_path=attachment
-            )
+    # Send summary email (all attachments in one message)
+    if all_summaries and all_attachments:
+        send_summary_email(all_summaries, all_attachments)
     
     elapsed = time.time() - start_time
-    print(f"\n{'='*40}")
-    print(f"完成所有主题 | 用时: {elapsed:.1f}秒")
-    print(f"总处理论文数: {len(all_summaries)}")
-    print(f"生成摘要文件: {len(email_attachments)} 个")
-    print(f"{'='*40}")
+    print(f"\n{'=' * 40}")
+    print(f"Completed all topics | Time: {elapsed:.1f}s")
+    print(f"Total papers processed: {len(all_summaries)}")
+    print(f"Summary files generated: {len(all_attachments)}")
+    print(f"{'=' * 40}")
 
 if __name__ == "__main__":
     main()
