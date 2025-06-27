@@ -27,7 +27,6 @@ class Config:
     SEARCH_TOPICS = [t.strip() for t in os.getenv("SEARCH_TOPICS", "large language models,reinforcement learning,computer vision").split(",")]
     MAX_PAPERS_PER_TOPIC = int(os.getenv("MAX_PAPERS_PER_TOPIC", 30))
     DAYS_BACK = int(os.getenv("DAYS_BACK", 3))
-    SUMMARY_LANGUAGE = os.getenv("SUMMARY_LANGUAGE", "zh").lower()  # 'zh' or 'en'
     
     # File Paths
     PDF_DIR = os.getenv("PDF_DIR", "papers_pdf")
@@ -42,7 +41,7 @@ class Config:
     
     # Email Configuration
     EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "true").lower() == "true"
-    EMAIL_DISPLAY_NAME = os.getenv("EMAIL_DISPLAY_NAME", "ArXiv论文助手")
+    EMAIL_DISPLAY_NAME = os.getenv("EMAIL_DISPLAY_NAME", "ArXiv双语论文助手")
     EMAIL_SENDER = os.getenv("EMAIL_SENDER")
     EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
     EMAIL_RECEIVERS = [email.strip() for email in os.getenv("EMAIL_RECEIVERS", "").split(",") if email.strip()]
@@ -60,7 +59,7 @@ def get_output_filename(topic: str) -> str:
     """Generate output filename with date and topic"""
     now = datetime.now()
     safe_topic = "".join(c if c.isalnum() else "_" for c in topic)
-    return os.path.join(Config.OUTPUT_DIR, f"arxiv_{safe_topic}_{now.strftime('%Y%m%d')}.txt")
+    return os.path.join(Config.OUTPUT_DIR, f"arxiv_bilingual_{safe_topic}_{now.strftime('%Y%m%d')}.txt")
 
 def init_database():
     """Initialize SQLite database"""
@@ -124,28 +123,9 @@ def download_pdf(paper: arxiv.Result) -> Optional[Tuple[str, str]]:
         print(f"Failed to download/process PDF: {str(e)}")
         return None
 
-def get_summary_prompt(paper: arxiv.Result, paper_text: str) -> str:
-    """Generate appropriate prompt based on configured language"""
-    if Config.SUMMARY_LANGUAGE == "zh":
-        return f"""请为以下学术论文生成详细的中文摘要，必须包含以下六个部分：
-
-(1). 研究背景与动机
-(2). 核心问题
-(3). 方法与技术
-(4). 关键结果
-(5). 创新与贡献
-(6). 意义与展望
-
-论文信息:
-标题: {paper.title}
-作者: {', '.join(author.name for author in paper.authors)}
-发表日期: {paper.published.date() if paper.published else '未知'}
-链接: {paper.entry_id}
-
-请基于以下论文内容生成摘要:
-{paper_text[:12000]}..."""
-    else:  # Default to English
-        return f"""Please generate a detailed academic summary in English with the following six sections:
+def get_english_summary_prompt(paper: arxiv.Result, paper_text: str) -> str:
+    """Generate English summary prompt"""
+    return f"""Please generate a detailed academic summary in English with the following six sections:
 
 (1). Background and Motivation
 (2). Core Problem
@@ -163,21 +143,28 @@ Link: {paper.entry_id}
 Please generate the summary based on:
 {paper_text[:12000]}..."""
 
-def get_system_message() -> str:
-    """Get system message based on configured language"""
-    if Config.SUMMARY_LANGUAGE == "zh":
-        return "你是一位资深学术研究员，需要用专业但易懂的中文总结论文核心内容。"
-    else:
-        return "You are a senior academic researcher who needs to summarize paper core content professionally but accessibly."
+def get_translation_prompt(english_summary: str) -> str:
+    """Generate translation prompt for English to Chinese"""
+    return f"""请将以下英文学术论文摘要翻译成中文，保持原有的结构和格式，确保学术术语的准确性。请保持六个部分的标题格式：
 
-def generate_llm_summary(paper: arxiv.Result, paper_text: str) -> str:
-    """Generate structured paper summary using LLM"""
-    prompt = get_summary_prompt(paper, paper_text)
-    system_message = get_system_message()
+(1). 研究背景与动机
+(2). 核心问题  
+(3). 方法与技术
+(4). 关键结果
+(5). 创新与贡献
+(6). 意义与展望
+
+要翻译的英文摘要：
+{english_summary}"""
+
+def generate_english_summary(paper: arxiv.Result, paper_text: str) -> str:
+    """Generate English summary"""
+    prompt = get_english_summary_prompt(paper, paper_text)
+    system_message = "You are a senior academic researcher who needs to summarize paper core content professionally but accessibly."
     
     try:
         delay = random.uniform(Config.MIN_API_DELAY, Config.MAX_API_DELAY)
-        print(f"Waiting {delay:.1f}s before calling API for {Config.SUMMARY_LANGUAGE} summary...")
+        print(f"Waiting {delay:.1f}s before calling API for English summary...")
         time.sleep(delay)
         
         response = openai_client.chat.completions.create(
@@ -190,38 +177,75 @@ def generate_llm_summary(paper: arxiv.Result, paper_text: str) -> str:
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"Failed to generate summary: {str(e)}")
-        return f"Summary generation failed: {str(e)}"
+        print(f"Failed to generate English summary: {str(e)}")
+        return f"English summary generation failed: {str(e)}"
+
+def translate_to_chinese(english_summary: str) -> str:
+    """Translate English summary to Chinese"""
+    prompt = get_translation_prompt(english_summary)
+    system_message = "你是一位专业的学术翻译专家，擅长将英文学术内容准确翻译成中文，保持原意和学术性。"
+    
+    try:
+        delay = random.uniform(Config.MIN_API_DELAY, Config.MAX_API_DELAY)
+        print(f"Waiting {delay:.1f}s before calling API for Chinese translation...")
+        time.sleep(delay)
+        
+        response = openai_client.chat.completions.create(
+            model=Config.LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2  # Lower temperature for more consistent translation
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Failed to translate to Chinese: {str(e)}")
+        return f"Chinese translation failed: {str(e)}"
+
+def generate_bilingual_summaries(paper: arxiv.Result, paper_text: str) -> Tuple[str, str]:
+    """Generate English summary first, then translate to Chinese"""
+    print("Generating English summary...")
+    english_summary = generate_english_summary(paper, paper_text)
+    
+    print("Translating to Chinese...")
+    chinese_summary = translate_to_chinese(english_summary)
+    
+    return chinese_summary, english_summary
 
 def create_summary_file(topic: str, summaries: List[Dict]) -> str:
-    """Create summary file and return file path"""
+    """Create bilingual summary file and return file path"""
     output_file = get_output_filename(topic)
     with open(output_file, "w", encoding="utf-8") as f:
         # File header
         f.write("=" * 80 + "\n")
-        f.write(f"ArXiv Paper Summary - {topic}\n")
+        f.write(f"ArXiv Bilingual Paper Summary - {topic}\n")
+        f.write(f"ArXiv 双语论文摘要 - {topic}\n")
         f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("=" * 80 + "\n\n")
         
         # Paper details
         for i, summary in enumerate(summaries, 1):
-            f.write(f"[Paper {i}]\n")
-            f.write(f"Title: {summary['title']}\n")
-            f.write(f"Link: {summary['url']}\n")
-            f.write(f"Date: {summary['published']}\n")
-            f.write(f"Authors: {summary['authors']}\n\n")
+            f.write(f"[Paper {i} / 论文 {i}]\n")
+            f.write(f"Title/标题: {summary['title']}\n")
+            f.write(f"Link/链接: {summary['url']}\n")
+            f.write(f"Date/日期: {summary['published']}\n")
+            f.write(f"Authors/作者: {summary['authors']}\n\n")
             
-            f.write("=== Original Abstract ===\n")
+            f.write("=== Original Abstract / 原始摘要 ===\n")
             f.write(f"{summary['arxiv_summary']}\n\n")
             
-            f.write(f"=== Generated Summary ({Config.SUMMARY_LANGUAGE.upper()}) ===\n")
-            f.write(f"{summary['llm_summary']}\n")
+            f.write("=== Chinese Summary / 中文摘要 ===\n")
+            f.write(f"{summary['chinese_summary']}\n\n")
+            
+            f.write("=== English Summary / 英文摘要 ===\n")
+            f.write(f"{summary['english_summary']}\n")
             f.write("=" * 80 + "\n\n")
     
     return output_file
 
 def send_summary_email(summaries: List[Dict], attachments: List[str]) -> bool:
-    """Send summary email with all attachments in one message"""
+    """Send bilingual summary email with all attachments in one message"""
     if not Config.EMAIL_ENABLED or not Config.EMAIL_RECEIVERS:
         print("Email disabled or no receivers configured")
         return False
@@ -230,22 +254,22 @@ def send_summary_email(summaries: List[Dict], attachments: List[str]) -> bool:
         msg = MIMEMultipart()
         msg['From'] = formataddr((Config.EMAIL_DISPLAY_NAME, Config.EMAIL_SENDER))
         msg['To'] = ", ".join(Config.EMAIL_RECEIVERS)
-        msg['Subject'] = f"ArXiv Paper Summary {datetime.now().strftime('%Y-%m-%d')}"
+        msg['Subject'] = f"ArXiv Bilingual Paper Summary / 双语论文摘要 {datetime.now().strftime('%Y-%m-%d')}"
         
-        # Email body content
-        if Config.SUMMARY_LANGUAGE == "zh":
-            email_content = f"ArXiv论文摘要 ({datetime.now().strftime('%Y-%m-%d')})\n\n"
-            email_content += f"发现 {len(summaries)} 篇新论文\n\n"
-        else:
-            email_content = f"ArXiv Paper Summary ({datetime.now().strftime('%Y-%m-%d')})\n\n"
-            email_content += f"Found {len(summaries)} new papers\n\n"
+        # Email body content (bilingual)
+        email_content = f"ArXiv Bilingual Paper Summary / ArXiv 双语论文摘要 ({datetime.now().strftime('%Y-%m-%d')})\n\n"
+        email_content += f"Found {len(summaries)} new papers / 发现 {len(summaries)} 篇新论文\n\n"
         
         for i, summary in enumerate(summaries, 1):
             email_content += f"{i}. {summary['title']}\n"
-            email_content += f"Link: {summary['url']}\n"
-            email_content += f"Summary ({Config.SUMMARY_LANGUAGE.upper()}):\n"
-            email_content += f"{summary['llm_summary']}\n"
-            email_content += "-" * 60 + "\n"
+            email_content += f"Link/链接: {summary['url']}\n\n"
+            
+            email_content += "Chinese Summary / 中文摘要:\n"
+            email_content += f"{summary['chinese_summary']}\n\n"
+            
+            email_content += "English Summary / 英文摘要:\n"
+            email_content += f"{summary['english_summary']}\n"
+            email_content += "-" * 60 + "\n\n"
         
         msg.attach(MIMEText(email_content, 'plain', 'utf-8'))
         
@@ -262,7 +286,7 @@ def send_summary_email(summaries: List[Dict], attachments: List[str]) -> bool:
             server.login(Config.EMAIL_SENDER, Config.EMAIL_PASSWORD)
             server.sendmail(Config.EMAIL_SENDER, Config.EMAIL_RECEIVERS, msg.as_string())
         
-        print(f"Email sent successfully to {len(Config.EMAIL_RECEIVERS)} recipients")
+        print(f"Bilingual email sent successfully to {len(Config.EMAIL_RECEIVERS)} recipients (EN→CN)")
         return True
     except smtplib.SMTPAuthenticationError:
         print("Authentication failed! Please check:")
@@ -297,7 +321,7 @@ def process_topic(topic: str) -> Tuple[List[Dict], str]:
                 continue
                 
             paper_text, pdf_path = result
-            llm_summary = generate_llm_summary(paper, paper_text)
+            chinese_summary, english_summary = generate_bilingual_summaries(paper, paper_text)
             
             summaries.append({
                 "title": paper.title,
@@ -305,12 +329,13 @@ def process_topic(topic: str) -> Tuple[List[Dict], str]:
                 "published": str(paper.published.date()) if paper.published else "Unknown",
                 "authors": ", ".join(author.name for author in paper.authors),
                 "arxiv_summary": paper.summary,
-                "llm_summary": llm_summary,
+                "chinese_summary": chinese_summary,
+                "english_summary": english_summary,
                 "pdf_path": pdf_path
             })
             
             mark_paper_as_processed(paper.get_short_id())
-            print("Paper processed successfully!")
+            print("Paper processed successfully! (English summary + Chinese translation)")
         except Exception as e:
             print(f"Error processing paper: {str(e)}")
             continue
@@ -324,7 +349,8 @@ def process_topic(topic: str) -> Tuple[List[Dict], str]:
 
 def main():
     """Main execution function"""
-    print("Initializing database...")
+    print("Initializing bilingual ArXiv summarizer (English → Chinese)...")
+    print("Process: Generate English summary first, then translate to Chinese")
     init_database()
     
     start_time = time.time()
@@ -347,6 +373,8 @@ def main():
     print(f"Completed all topics | Time: {elapsed:.1f}s")
     print(f"Total papers processed: {len(all_summaries)}")
     print(f"Summary files generated: {len(all_attachments)}")
+    print(f"Each paper includes English summary + Chinese translation")
+    print(f"Process: English summary → Chinese translation")
     print(f"{'=' * 40}")
 
 if __name__ == "__main__":
